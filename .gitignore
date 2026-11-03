@@ -1,0 +1,5 @@
+node_modules/
+.adt-workspace/
+tests/artifacts/
+*.log
+.env
