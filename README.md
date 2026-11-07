@@ -30,6 +30,10 @@ npx playwright install chromium
 
 The UI uses real task progress, saved checkpoints, short labels, illustrated help dialogs, and reduced-motion support. A connected key is needed for AI analysis, guideline generation and repair; local import, comparison, verification and export work without one.
 
+### Arrange New ADT pages
+
+On **Compare**, select a page mapped to the PDF and choose **Arrange pages**. Select any New ADT page for that PDF page, move it up or down, add a blank page after it, or remove it from the reader. The reading order, page links, and table of contents update immediately. Removed pages remain in saved history. Select a new page and use **Repair this page** to generate its content from the PDF, then review the result and run whole-book checks before export.
+
 ## Agent execution
 
 The server runs the OpenAI Responses API tool loop. The same selected model performs inspection, repair, and critique. Current choices are GPT-6.1 Sol and GPT-6 Astra. The model can make full file edits inside a candidate snapshot; it is not limited to the earlier tool's fixed layout recipes. No model tool can execute a host shell or read files outside the imported project.
