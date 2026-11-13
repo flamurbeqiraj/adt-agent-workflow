@@ -7,6 +7,7 @@ import {createApp} from '../server.mjs';
 import {OpenAIClient} from '../lib/openai.mjs';
 import {Jobs,recoverPageObservation} from '../lib/jobs.mjs';
 import {Store} from '../lib/store.mjs';
+import {sha,unpack} from '../lib/archive.mjs';
 import {invalidateChangedReviews} from '../lib/review.mjs';
 import {fixtureFiles} from './fixtures.mjs';
 import {fixtureZIP,fixturePDF,fixtureGuidelines} from './fixtures.mjs';
@@ -21,7 +22,7 @@ test('local API separates preview origin, guards mutations, persists guides, and
     const guide=await(await fetch(origin+'/api/projects/'+p.id+'/guidelines',{method:'PUT',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify(fixtureGuidelines)})).json();assert.equal(guide.guidelineRevision,1);
     assert.equal((await fetch(origin+'/api/projects/'+p.id+'/file?path=..%2Fsecret')).status,400);
     const preview=await fetch(app.previewOrigin+'/book/'+p.id+'/'+p.revision+'/pg001_sec001.html');assert.equal(preview.status,200);assert.match(preview.headers.get('Content-Security-Policy'),/connect-src 'self'/);assert.ok(!(await preview.text()).includes(session.token));
-    const report=await(await fetch(origin+'/api/projects/'+p.id+'/report')).json();assert.equal(report.pdf.pages.length,0);assert.ok(!JSON.stringify(report).includes(session.token));
+    const report=await(await fetch(origin+'/api/projects/'+p.id+'/report')).json();assert.equal(report.inventory.original.counts.screens,2);assert.equal(report.inventory.final.counts.screens,2);assert.ok(Array.isArray(report.sourceToFinalScreens));assert.ok(!JSON.stringify(report).includes(session.token));
     const zip=await fetch(origin+'/api/projects/'+p.id+'/export');assert.equal(zip.status,200);assert.equal(zip.headers.get('X-Export-Status'),'needs-review');
     await fetch(origin+'/api/projects/'+p.id+'/review',{method:'PUT',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({href:p.pages[0].href,approved:true})});
     const saved=await fetch(origin+'/api/projects/'+p.id+'/export');
@@ -49,6 +50,117 @@ test('books can be deleted without affecting other books, but not during an acti
   }finally{await app.close();await fs.rm(workspace,{recursive:true,force:true});}
 });
 
+test('approving a previewed version selects the exact page exported',async()=>{
+  const workspace=await fs.mkdtemp(path.join(os.tmpdir(),'adt-reviewed-export-'));
+  const app=await createApp({port:8912,previewPort:8913,workspace});
+  try{
+    const session=await(await fetch(app.origin+'/api/session')).json(),headers={'X-Studio-Token':session.token,'Content-Type':'application/json'};
+    const created=await(await fetch(app.origin+'/api/projects?name=fixture.zip',{method:'POST',headers,body:fixtureZIP()})).json();
+    const p=app.store.get(created.id),href=p.pages[0].href,otherHref=p.pages[1].href,original=(await app.store.read(p,href)).toString(),otherOriginal=(await app.store.read(p,otherHref)).toString();
+    const updated=original.replace('class="broken"','class="reviewed"');
+    const files={...p.files,[href]:await app.store.blob(p,updated),[otherHref]:await app.store.blob(p,otherOriginal.replace('Your turn','Another version'))},revision=sha(JSON.stringify(files)).slice(0,20);
+    p.revisions[revision]=files;
+    p.versions[href]=[{id:'candidate-1',href,revision,baseRevision:p.revision,kind:'candidate',label:'Reviewed candidate',changed:[href,otherHref]}];
+    await app.store.save(p);
+    const otherReview=await fetch(app.origin+'/api/projects/'+p.id+'/review',{method:'PUT',headers,body:JSON.stringify({href:otherHref,approved:true})});
+    assert.equal(otherReview.status,200);
+    const currentReview=await fetch(app.origin+'/api/projects/'+p.id+'/review',{method:'PUT',headers,body:JSON.stringify({href,approved:true})});
+    assert.equal(currentReview.status,200);
+    assert.equal((await currentReview.json()).revision,created.revision);
+    const response=await fetch(app.origin+'/api/projects/'+p.id+'/review',{method:'PUT',headers,body:JSON.stringify({href,approved:true,versionId:'candidate-1',previewRevision:revision})});
+    assert.equal(response.status,200);
+    const reviewed=await response.json();
+    assert.equal(reviewed.decisions[href].humanReviewed,true);
+    assert.equal(reviewed.selectedVersions[href],'candidate-1');
+    assert.equal(reviewed.decisions[href].reviewedVersionId,'candidate-1');
+    assert.equal(reviewed.decisions[href].reviewedPageSHA256,files[href]);
+    assert.equal(reviewed.decisions[otherHref].humanReviewed,true);
+    assert.equal(p.files[otherHref],p.original[otherHref]);
+    assert.notEqual(reviewed.revision,created.revision);
+    const exported=await fetch(app.origin+'/api/projects/'+p.id+'/export');
+    assert.equal(exported.status,200);
+    const archive=unpack(Buffer.from(await exported.arrayBuffer()));
+    assert.equal(archive[href].toString(),updated);
+    assert.equal(archive[otherHref].toString(),otherOriginal);
+    assert.equal(JSON.parse(archive['studio/review-report.json']).decisions[href].humanReviewed,true);
+    assert.equal(sha(archive[href]),reviewed.decisions[href].reviewedPageSHA256);
+  }finally{await app.close();await fs.rm(workspace,{recursive:true,force:true});}
+});
+
+test('selecting a saved page keeps later generated manifest changes',async()=>{
+  const workspace=await fs.mkdtemp(path.join(os.tmpdir(),'adt-version-merge-'));
+  const app=await createApp({port:8914,previewPort:8915,workspace});
+  try{
+    const session=await(await fetch(app.origin+'/api/session')).json(),headers={'X-Studio-Token':session.token,'Content-Type':'application/json'};
+    const created=await(await fetch(app.origin+'/api/projects?name=fixture.zip',{method:'POST',headers,body:fixtureZIP()})).json();
+    const p=app.store.get(created.id),href=p.pages[0].href,original=(await app.store.read(p,href)).toString();
+    const other=(await app.store.read(p,p.pages[1].href)).toString(),cache=prefix=>`${prefix}var INLINE = ${JSON.stringify({[href]:original,[p.pages[1].href]:other})};`;
+    const initialManifest=await app.store.blob(p,'<manifest><resource></resource></manifest>');
+    p.files['imsmanifest.xml']=initialManifest;
+    p.files['assets/offline-preloader.js']=await app.store.blob(p,cache(''));
+    const baseRevision=sha(JSON.stringify(p.files)).slice(0,20);
+    p.revision=baseRevision;p.revisions[baseRevision]={...p.files};
+    const candidateManifest=await app.store.blob(p,'<manifest><resource><file href="pg001_sec001.html"/></resource></manifest>');
+    const updated=original.replace('class="broken"','class="reviewed"');
+    const candidateFiles={...p.files,[href]:await app.store.blob(p,updated),'imsmanifest.xml':candidateManifest,'assets/offline-preloader.js':await app.store.blob(p,cache('/* candidate */')),'assets/book.js':await app.store.blob(p,'/* candidate shared code */')};
+    const candidateRevision=sha(JSON.stringify(candidateFiles)).slice(0,20);
+    p.revisions[candidateRevision]=candidateFiles;
+    p.versions[href]=[{id:'candidate-with-manifest',href,revision:candidateRevision,baseRevision,kind:'candidate',label:'Reviewed candidate',changed:[href,'imsmanifest.xml','assets/offline-preloader.js','assets/book.js']}];
+    p.files['imsmanifest.xml']=await app.store.blob(p,'<manifest><resource><file href="pg002_sec001.html"/></resource></manifest>');
+    p.files['assets/offline-preloader.js']=await app.store.blob(p,cache('/* later */'));
+    p.files['assets/book.js']=await app.store.blob(p,'/* later shared code */');
+    p.revision=sha(JSON.stringify(p.files)).slice(0,20);p.revisions[p.revision]={...p.files};
+    await app.store.save(p);
+    const response=await fetch(app.origin+'/api/projects/'+p.id+'/review',{method:'PUT',headers,body:JSON.stringify({href,approved:true,versionId:'candidate-with-manifest'})});
+    assert.equal(response.status,200,await response.text());
+    assert.equal(p.decisions[href].reviewedVersionId,'candidate-with-manifest');
+    assert.equal((await app.store.read(p,href)).toString(),updated);
+    assert.match((await app.store.read(p,'imsmanifest.xml')).toString(),/pg002_sec001\.html/);
+    assert.match((await app.store.read(p,'assets/offline-preloader.js')).toString(),/\/\* later \*\//);
+    assert.equal((await app.store.read(p,'assets/book.js')).toString(),'/* later shared code */');
+  }finally{await app.close();await fs.rm(workspace,{recursive:true,force:true});}
+});
+
+test('batch selection keeps later shared code, restores reviews, and reports broken candidates',async()=>{
+  const workspace=await fs.mkdtemp(path.join(os.tmpdir(),'adt-latest-batch-'));
+  const app=await createApp({port:8916,previewPort:8917,workspace});
+  try{
+    const session=await(await fetch(app.origin+'/api/session')).json(),headers={'X-Studio-Token':session.token,'Content-Type':'application/json'};
+    const created=await(await fetch(app.origin+'/api/projects?name=fixture.zip',{method:'POST',headers,body:fixtureZIP()})).json();
+    const p=app.store.get(created.id),first=p.pages[0].href,second=p.pages[1].href;
+    const firstHtml=(await app.store.read(p,first)).toString(),secondHtml=(await app.store.read(p,second)).toString(),shared=p.files['assets/book.js'];
+    const firstCandidate=firstHtml.replace('class="broken"','class="reviewed"');
+    const firstMap={...p.files,[first]:await app.store.blob(p,firstCandidate),'assets/book.js':await app.store.blob(p,'/* older shared code */')};
+    const firstRevision=sha(JSON.stringify(firstMap)).slice(0,20);p.revisions[firstRevision]=firstMap;
+    p.versions[first]=[{id:'latest-first',href:first,revision:firstRevision,baseRevision:p.revision,kind:'candidate',changed:[first,'assets/book.js']}];
+    const secondMap={...p.files,[second]:await app.store.blob(p,secondHtml.replace('pg001_sec001.html','missing.html'))};
+    const secondRevision=sha(JSON.stringify(secondMap)).slice(0,20);p.revisions[secondRevision]=secondMap;
+    p.versions[second]=[{id:'latest-second',href:second,revision:secondRevision,baseRevision:p.revision,kind:'candidate',changed:[second]}];
+    p.decisions[first]={humanReviewed:false,reviewedRevision:p.revision};p.decisions[second]={humanReviewed:false,reviewedRevision:p.revision};
+    p.files['assets/book.js']=await app.store.blob(p,'/* later shared code */');
+    p.revision=sha(JSON.stringify(p.files)).slice(0,20);p.revisions[p.revision]={...p.files};await app.store.save(p);
+    const response=await fetch(app.origin+'/api/projects/'+p.id+'/latest-versions',{method:'POST',headers,body:JSON.stringify({revision:p.revision})});
+    assert.equal(response.status,200);
+    const result=await response.json();
+    assert.deepEqual(result.applied.map(row=>row.href),[first]);
+    assert.deepEqual(result.skipped.map(row=>row.href),[second]);
+    assert.deepEqual(result.preservedSharedFiles,['assets/book.js']);
+    assert.equal(result.restoredReviews,2);
+    assert.equal(result.project.pages.length,2);
+    assert.equal(result.project.selectedVersions[first],'latest-first');
+    assert.ok(result.project.pages.every(page=>result.project.decisions[page.href].humanReviewed));
+    assert.equal((await app.store.read(p,'assets/book.js')).toString(),'/* later shared code */');
+    assert.notEqual(p.files['assets/book.js'],shared);
+    const exportedBytes=Buffer.from(await(await fetch(app.origin+'/api/projects/'+p.id+'/export')).arrayBuffer()),archive=unpack(exportedBytes);
+    assert.equal(archive[first].toString(),firstCandidate);
+    assert.equal(archive[second].toString(),secondHtml);
+    const reimported=await(await fetch(app.origin+'/api/projects?name=batch-export.zip',{method:'POST',headers,body:exportedBytes})).json();
+    assert.equal(reimported.selectedVersions[first],'latest-first');
+    assert.deepEqual(reimported.latestSelection.skipped.map(row=>row.href),[second]);
+    assert.ok(reimported.pages.every(page=>reimported.decisions[page.href].humanReviewed));
+  }finally{await app.close();await fs.rm(workspace,{recursive:true,force:true});}
+});
+
 test('manual New ADT page edits preserve review marks across page changes and restart',async()=>{
   const workspace=await fs.mkdtemp(path.join(os.tmpdir(),'adt-manual-'));let app=await createApp({port:8910,previewPort:8911,workspace});
   try{
@@ -56,7 +168,7 @@ test('manual New ADT page edits preserve review marks across page changes and re
     let project=await(await fetch(app.origin+'/api/projects?name=fixture.zip',{method:'POST',headers,body:fixtureZIP()})).json();
     project=await(await fetch(app.origin+'/api/projects/'+project.id+'/pdf?name=source.pdf',{method:'PUT',headers,body:fixturePDF()})).json();
     app.jobs.start(app.store.get(project.id),'inventory');
-    while(app.store.get(project.id).job.status==='running')await new Promise(resolve=>setTimeout(resolve,20));
+    while(app.store.get(project.id).job.status==='running'||app.jobs.active.has(project.id))await new Promise(resolve=>setTimeout(resolve,20));
     assert.equal(app.store.get(project.id).job.status,'completed');
     project=await(await fetch(app.origin+'/api/projects/'+project.id)).json();
     for(const page of project.pages)project=await(await fetch(app.origin+'/api/projects/'+project.id+'/review',{method:'PUT',headers,body:JSON.stringify({href:page.href,approved:true})})).json();

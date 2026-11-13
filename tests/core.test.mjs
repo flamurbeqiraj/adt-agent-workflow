@@ -13,11 +13,29 @@ import {exportProject,restoreImportedHistory} from '../lib/export.mjs';
 import {fixtureFiles,fixtureZIP,fixturePDF,fixtureGuidelines} from './fixtures.mjs';
 import {runInNewContext} from 'node:vm';
 import {preparePreviewScript} from '../lib/preview.mjs';
+import {auditBook,sourceScreenMap} from '../lib/blueprint.mjs';
+import {scoreBook} from '../lib/scorecard.mjs';
+import {missingGlyphs} from '../lib/font-coverage.mjs';
 
 test('isolated preview exits SCORM discovery at a cross-origin parent without changing stored bytes',()=>{
   const code='function findAPI(win){while(win){if (win.API) return win.API;win=win.parent;}return null;}result=findAPI(window);',original=Buffer.from(code);
   const foreign={get API(){throw Error('Cross-origin parent');}},context={window:{parent:foreign}};
   runInNewContext(preparePreviewScript('assets/scorm.js',original).toString(),context);assert.equal(context.result,null);assert.equal(original.toString(),code);assert.equal(preparePreviewScript('other.js',original),original);
+});
+
+test('blueprint audit records source and final inventories from visible HTML',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'adt-blueprint-'));
+  try{const store=new Store(root);await store.init();const p=await store.create(fixtureFiles());const original=await auditBook(store,p,p.original);assert.deepEqual(original.counts,{screens:2,visibleTextIds:0,activityControls:2,imageReferences:0,quizScreens:0,quizPayloads:0,audioElements:0,audioMappings:0});const files={...p.files};files['pg001_sec001.html']=await store.blob(p,(await store.read(p,'pg001_sec001.html')).toString().replace('id="thoughts"','id="thoughts" data-id="pg001_prompt"'));const final=await auditBook(store,p,files);assert.equal(final.counts.visibleTextIds,1);assert.equal(final.pages[0].activityClass,'digital');p.pdf={pages:[{page:1},{page:2},{page:3}]};const map=sourceScreenMap(p,original,final);assert.equal(map[0].original[0],'pg001_sec001.html');assert.equal(map[2].status,'source-only');}finally{await fs.rm(root,{recursive:true,force:true});}
+});
+
+test('blueprint scorecard flags shell drift and measured reading defects',()=>{
+  const view=(href,x)=>({href,width:390,viewportHeight:844,variant:'default',contentBox:{x,right:x+350,width:350},padding:{left:20,right:20},scrollHeight:0,overflow:false,missingImages:[],blueprint:{findings:href==='second'?[{kind:'small-text'}]:[]},activities:{status:'passed'}});
+  const report={pages:[{href:'first',views:[view('first',20)],accessibility:{violations:[],incomplete:[]}},{href:'second',views:[view('second',28)],accessibility:{violations:[],incomplete:[]}}],navigation:{status:'passed'}};
+  scoreBook(report,{decisions:{}});assert.equal(report.sharedShell['390x844'].status,'failed');assert.equal(report.pages[0].scorecard.width,'failed');assert.equal(report.pages[1].scorecard.font,'failed');assert.equal(report.pages[1].scorecard.shapes,'not-tested');
+});
+
+test('bundled static Poppins weights cover Albanian text glyphs',async()=>{
+  for(const weight of [400,600,700]){const font=await fs.readFile(new URL(`../public/fonts/Poppins-${weight}.ttf`,import.meta.url));assert.deepEqual(missingGlyphs(font,['A','ë','ç','Ë','Ç','—']),[]);assert.deepEqual(missingGlyphs(font,['😀']),['😀']);}
 });
 
 test('exported history round-trips without recursively embedding prior exports',async()=>{

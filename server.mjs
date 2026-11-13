@@ -11,10 +11,11 @@ import {BrowserService} from './lib/browser.mjs';
 import {OpenAIClient,MODELS} from './lib/openai.mjs';
 import {CredentialStore} from './lib/credential.mjs';
 import {Jobs,validateGuidelines} from './lib/jobs.mjs';
-import {exportProject,restoreImportedHistory} from './lib/export.mjs';
+import {exportProject,reviewReport,restoreImportedHistory} from './lib/export.mjs';
 import {preparePreviewScript} from './lib/preview.mjs';
 import {editPages} from './lib/manual-pages.mjs';
 import {invalidateChangedReviews} from './lib/review.mjs';
+import {selectLatestVersions} from './lib/latest-versions.mjs';
 
 const cwd=fileURLToPath(new URL('.',import.meta.url));
 const mime={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.mjs':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.xml':'application/xml','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.woff2':'font/woff2','.woff':'font/woff','.ttf':'font/ttf','.mp3':'audio/mpeg','.mp4':'video/mp4','.pdf':'application/pdf','.wasm':'application/wasm'};
@@ -33,6 +34,39 @@ export async function createApp({port=Number(process.env.PORT||8892),previewPort
   const assertIdle=p=>{if(jobs.active.has(p.id))throw Object.assign(Error('Pause the active task first.'),{status:409});};
   async function imported(buffer,name){const files=unpack(buffer),p=await store.create(files,name.replace(/\.zip$/i,''));p.sourceHash=sha(buffer);p.archiveName=name;await restoreImportedHistory(store,p);p.pages=await inventory(store,p);let config;try{config=JSON.parse(decode(await store.read(p,'assets/config.json')));}catch{}p.name=config?.title||documentOf(decode(await store.read(p,p.pages[0].href))).title||p.name;await store.save(p);return p;}
   async function attachPDF(p,buffer,name){if(!buffer.subarray(0,1024).includes(Buffer.from('%PDF-')))throw Error('Choose a PDF file.');const hash=await store.blob(p,buffer),sameSource=(p.expectedSourceHash||p.pdf?.hash)===hash;p.pdf={name,hash,pages:[],bytes:buffer.length};p.observations=[];p.stage=0;if(!sameSource){p.guidelines=null;p.guidelineRevision=0;p.decisions={};}else if(p.guidelines){validateGuidelines(p.guidelines);p.stage=3;}p.validation=null;await pdf.open(p);await store.save(p);}
+  async function selectVersion(p,{href,id,wholeProject=false,singlePage=false}){
+    const version=(p.versions[href]||[]).find(v=>v.id===id);
+    if(!version)throw Error('Version not found.');
+    const map=p.revisions[version.revision];
+    if(!map)throw Error('Version snapshot unavailable.');
+    if(!map[href]&&!wholeProject)throw Error('This saved version removes the page from the reader.');
+    const beforeFiles={...p.files};let files={...p.files};
+    if(wholeProject)files={...map};
+    else{
+      const base=p.revisions[version.baseRevision]||p.original,changed=version.kind==='original'?[href]:version.changed;
+      const snapshotPages=JSON.parse(decode(await store.read(p,'content/pages.json',map)));
+      const pageFiles=new Set([...p.pages.map(page=>page.href),...snapshotPages.map(page=>page.href)]);
+      for(const name of changed){
+        if(name==='assets/offline-preloader.js'||name==='imsmanifest.xml'||name==='content/pages.json')continue;
+        if(singlePage&&name!==href&&pageFiles.has(name))continue;
+        if(name!==href&&pageFiles.has(name)&&p.files[name]!==base[name]&&p.files[name]!==map[name])continue;
+        if(name!==href&&p.files[name]!==base[name]&&p.files[name]!==map[name])continue;
+        if(map[name])files[name]=map[name];else delete files[name];
+      }
+    }
+    await synchronise(store,p,files);
+    const before=await structureChecks(store,p),after=await structureChecks(store,p,files);
+    const existing=new Set(before.errors.map(e=>JSON.stringify(e)));
+    if(after.errors.some(e=>!existing.has(JSON.stringify(e))))throw Error('This version would break project references. Restore its whole checkpoint.');
+    await store.revision(p,files,{action:'Selected '+version.label,href});
+    invalidateChangedReviews(p,beforeFiles,files);
+    p.selectedVersions[href]=version.id;
+    const old=p.pages;p.pages=await inventory(store,p);
+    p.retiredPages=(p.retiredPages||[]).filter(item=>!p.pages.some(page=>page.href===item.href));
+    mapPages(p);
+    for(const page of p.pages){const previous=old.find(item=>item.href===page.href);if(previous?.mappingConfidence===1)Object.assign(page,{sourcePage:previous.sourcePage,mappingConfidence:1,mappingStatus:previous.mappingStatus});}
+    await store.save(p);
+  }
   const server=http.createServer(async(req,res)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');try{
     if(![`127.0.0.1:${port}`,`localhost:${port}`].includes(req.headers.host))throw Object.assign(Error('Invalid host.'),{status:403});const url=new URL(req.url,origin),parts=url.pathname.split('/').filter(Boolean),method=req.method;
     if(parts[0]==='api'){
@@ -56,12 +90,12 @@ export async function createApp({port=Number(process.env.PORT||8892),previewPort
         if(action==='guidelines'&&method==='PUT'){assertIdle(p);const input=validateGuidelines(await data(req));if(p.guidelines)p.guidelineHistory.push({revision:p.guidelineRevision,value:p.guidelines});p.guidelines=input;p.guidelineRevision++;p.stage=Math.max(p.stage,3);await store.save(p);return json(res,store.summary(p));}
         if(action==='mapping'&&method==='PUT'){assertIdle(p);const input=await data(req),page=p.pages.find(s=>s.href===input.href);if(!page||input.page!==null&&!p.pdf?.pages.some(s=>s.page===input.page))throw Error('Choose a valid section and PDF page.');Object.assign(page,{sourcePage:input.page,mappingStatus:input.page?'mapped':'companion',mappingConfidence:1,mappingReason:'Confirmed by user'});p.mappingRevision=(p.mappingRevision||0)+1;p.decisions[input.href]={...p.decisions[input.href],humanReviewed:false};for(const source of p.pdf.pages)source.sectionHrefs=p.pages.filter(s=>s.sourcePage===source.page).map(s=>s.href);p.validation=null;await store.save(p);return json(res,store.summary(p));}
         if(action==='pages'&&method==='POST'){assertIdle(p);const input=await data(req),selected=await editPages(store,p,input);return json(res,{...store.summary(p),selected});}
-        if(action==='review'&&method==='PUT'){assertIdle(p);const input=await data(req);if(!p.pages.some(s=>s.href===input.href))throw Error('Unknown page.');p.decisions[input.href]={...p.decisions[input.href],humanReviewed:!!input.approved,reviewedRevision:p.revision};await store.save(p);return json(res,store.summary(p));}
-        if(action==='version'&&method==='POST'){assertIdle(p);const input=await data(req),version=(p.versions[input.href]||[]).find(v=>v.id===input.id);if(!version)throw Error('Version not found.');const map=p.revisions[version.revision];if(!map)throw Error('Version snapshot unavailable.');const beforeFiles={...p.files};let files={...p.files};if(input.wholeProject)files={...map};else{const base=p.revisions[version.baseRevision]||p.original,changed=version.kind==='original'?[input.href]:version.changed;for(const name of changed){if(name!==input.href&&p.files[name]!==base[name]&&p.files[name]!==map[name])throw Object.assign(Error('A shared file changed later. Restore the entire checkpoint or regenerate this page.'),{status:409});if(map[name])files[name]=map[name];else delete files[name];}}
-          await synchronise(store,p,files);const before=await structureChecks(store,p),after=await structureChecks(store,p,files);const existing=new Set(before.errors.map(e=>JSON.stringify(e)));if(after.errors.some(e=>!existing.has(JSON.stringify(e))))throw Error('This version would break project references. Restore its whole checkpoint.');await store.revision(p,files,{action:'Selected '+version.label,href:input.href});invalidateChangedReviews(p,beforeFiles,files);p.selectedVersions[input.href]=version.id;const old=p.pages;p.pages=await inventory(store,p);p.retiredPages=(p.retiredPages||[]).filter(old=>!p.pages.some(page=>page.href===old.href));mapPages(p);for(const page of p.pages){const previous=old.find(s=>s.href===page.href);if(previous?.mappingConfidence===1)Object.assign(page,{sourcePage:previous.sourcePage,mappingConfidence:1,mappingStatus:previous.mappingStatus});}await store.save(p);return json(res,store.summary(p));}
+        if(action==='review'&&method==='PUT'){assertIdle(p);const input=await data(req);if(!p.pages.some(s=>s.href===input.href))throw Error('Unknown page.');if(input.approved&&input.versionId)await selectVersion(p,{href:input.href,id:input.versionId,singlePage:true});const selected=(p.versions[input.href]||[]).find(v=>v.id===p.selectedVersions[input.href]);const reviewedVersionId=input.approved?(input.versionId||((selected&&p.revisions[selected.revision]?.[input.href]===p.files[input.href])?selected.id:null)):null;p.decisions[input.href]={...p.decisions[input.href],humanReviewed:!!input.approved,reviewedRevision:p.revision,reviewedVersionId,reviewedPageSHA256:input.approved?p.files[input.href]:null};await store.save(p);return json(res,store.summary(p));}
+        if(action==='latest-versions'&&method==='POST'){assertIdle(p);const result=await selectLatestVersions(store,p,(await data(req)).revision);return json(res,{project:store.summary(p),...result});}
+        if(action==='version'&&method==='POST'){assertIdle(p);const input=await data(req);await selectVersion(p,{...input,singlePage:!input.wholeProject});return json(res,store.summary(p));}
         if(action==='file'&&method==='GET'){const name=safePath(url.searchParams.get('path')),revision=url.searchParams.get('revision')||p.revision,map=p.revisions[revision];if(!map)throw Error('Unknown revision.');const b=await store.read(p,name,map);return json(res,{path:name,hash:sha(b),content:decode(b).slice(0,300000)});}
         if(action==='export'&&method==='GET'){assertIdle(p);const {archive,report,evidence}=await exportProject(store,p);p.exportEvidence=evidence;await store.save(p);res.writeHead(200,{'Content-Type':'application/zip','Content-Disposition':`attachment; filename="ADT-${report.status}-${p.id.slice(0,8)}.zip"`,'X-Export-Status':report.status});return res.end(archive);}
-        if(action==='report'&&method==='GET'){res.setHeader('Content-Disposition','attachment; filename="ADT-review-report.json"');return json(res,{...store.summary(p),exportEvidence:p.exportEvidence});}
+        if(action==='report'&&method==='GET'){res.setHeader('Content-Disposition','attachment; filename="ADT-review-report.json"');return json(res,{...await reviewReport(store,p),exportEvidence:p.exportEvidence});}
       }
       throw Object.assign(Error('Unknown action.'),{status:404});
     }

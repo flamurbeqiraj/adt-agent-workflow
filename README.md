@@ -30,6 +30,12 @@ npx playwright install chromium
 
 The UI uses real task progress, saved checkpoints, short labels, illustrated help dialogs, and reduced-motion support. A connected key is needed for AI analysis, guideline generation and repair; local import, comparison, verification and export work without one.
 
+### Universal repair blueprint
+
+The repair agent now applies the [ADT repair blueprint](docs/ADT-REPAIR-BLUEPRINT.md) as binding book guidance. Its generated guidelines use a single centered reader shell with content-driven height, static Poppins 400/600/700, a 16 CSS px visible-text floor, balanced padding, meaningful page turns and disclosures, faithful source artwork, and activity classification. The agent can bundle the three licensed Poppins weights and their OFL license into a candidate, then update the book's CSS. The report checks font assets and Unicode coverage for visible reading text. The PDF still governs facts and artwork; answer keys remain source or ADT data, never guesses.
+
+Whole-book verification records the five requested viewports (1280×800, 1366×768, 820×1180, 390×844, 320×568) plus landscape, 200% zoom, large text, reduced motion, touch activity probes, and expanded or filled states when applicable. Browser measurements include shell edges, padding, font size and family, clipping, horizontal overflow, default scroll, and image resolution. Each section receives a scorecard; width is compared across all sections at each default viewport. Longer pages and low-resolution images are reported for review rather than hidden or shrunk. The export report contains original and final inventories, a source-to-screen map, changed image ledger, per-page browser evidence, and explicit untested items. A ZIP with unresolved blueprint checks is labeled `needs-review`.
+
 ### Arrange New ADT pages
 
 On **Compare**, select a page mapped to the PDF and choose **Arrange pages**. Select any New ADT page for that PDF page, move it up or down, add a blank page after it, or remove it from the reader. The reading order, page links, and table of contents update immediately. Removed pages remain in saved history. Select a new page and use **Repair this page** to generate its content from the PDF, then review the result and run whole-book checks before export.

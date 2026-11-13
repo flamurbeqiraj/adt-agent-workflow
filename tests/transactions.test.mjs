@@ -8,17 +8,17 @@ import {RepairAgent,selectDependentPages,validateStructureChange} from '../lib/a
 import {inventory,mapPages} from '../lib/adt.mjs';
 import {fixtureFiles,fixtureGuidelines} from './fixtures.mjs';
 
-async function scenario(actions,{failure=false,sourceOnly=false,critique='pass',structure=null}={}){
+async function scenario(actions,{failure=false,sourceOnly=false,sameSource=false,critique='pass',requestFulfillment='met',instructions='',structure=null}={}){
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'adt-transaction-')),store=new Store(root);await store.init();
   try{
-    const p=await store.create(fixtureFiles());p.pages=await inventory(store,p);p.guidelines=fixtureGuidelines;p.guidelineRevision=1;p.pdf={hash:'source',pages:[{page:1,text:'A shared world',runs:[]},{page:2,text:'Your turn',runs:[]},{page:3,text:'A new lesson',runs:[]}]};mapPages(p);if(structure?.kind==='merge'){p.pages[1].sourcePage=1;const entries=JSON.parse((await store.read(p,'content/pages.json')).toString());entries[1].page_number=1;await store.revision(p,{...p.files,'content/pages.json':await store.blob(p,JSON.stringify(entries))});}
-    const original=p.revision,outputs=[],renders=[];let step=0;
-    const ai={structured:async()=>({verdict:critique,sourceFidelity:4,visualFidelity:4,consistency:4,responsiveUsability:4,summary:'Fixture critique',issues:[]}),call:async(_p,_job,request)=>{const last=request.input.at(-1);if(last.type==='function_call_output')outputs.push(last.output);assert.ok(step<actions.length,'Agent requested an unexpected extra turn');const action=await actions[step]({p,store,outputs});return {output:[{type:'function_call',call_id:'test-'+step++,name:action.name,arguments:JSON.stringify(action.args)}]};}};
+    const p=await store.create(fixtureFiles());p.pages=await inventory(store,p);p.guidelines=fixtureGuidelines;p.guidelineRevision=1;p.pdf={hash:'source',pages:[{page:1,text:'A shared world',runs:[]},{page:2,text:'Your turn',runs:[]},{page:3,text:'A new lesson',runs:[]}]};mapPages(p);if(sameSource||structure?.kind==='merge'){p.pages[1].sourcePage=1;const entries=JSON.parse((await store.read(p,'content/pages.json')).toString());entries[1].page_number=1;await store.revision(p,{...p.files,'content/pages.json':await store.blob(p,JSON.stringify(entries))});}
+    const original=p.revision,outputs=[],renders=[],modelCalls=[],critiqueCalls=[];let step=0;
+    const ai={structured:async(_p,_job,request)=>{critiqueCalls.push(request);return {verdict:critique,requestFulfillment,requestEvidence:requestFulfillment==='met'?'Requested change visible.':'Requested change is missing.',sourceFidelity:4,visualFidelity:4,consistency:4,responsiveUsability:4,summary:'Fixture critique',issues:[]};},call:async(_p,_job,request)=>{modelCalls.push(request);const last=request.input.at(-1);if(last.type==='function_call_output')outputs.push(last.output);assert.ok(step<actions.length,'Agent requested an unexpected extra turn');const action=await actions[step]({p,store,outputs});return {output:[{type:'function_call',call_id:'test-'+step++,name:action.name,arguments:JSON.stringify(action.args)}]};}};
     const browser={render:async(_p,href,options)=>{renders.push({href,...options});return {report:{href,passed:!failure,activities:{status:'passed'}},image:Buffer.from('test-image')};},navigation:async()=>({status:'passed',rows:[]})};
     const agent=new RepairAgent({store,ai,browser,pdf:{image:async()=>Buffer.from('source-image')},progress:async()=>{}});
     const page=sourceOnly?{href:'source_3.html',section_id:'source_3',sourcePage:3,title:'New page'}:p.pages[0];
-    const result=await agent.run(p,{settings:{model:'test',budget:20,structure},cost:0},page,new AbortController().signal);
-    return {p,original,result,outputs,renders};
+    const result=await agent.run(p,{settings:{model:'test',budget:20,structure,instructions},cost:0},page,new AbortController().signal);
+    return {p,original,result,outputs,renders,modelCalls,critiqueCalls};
   }finally{await fs.rm(root,{recursive:true,force:true});}
 }
 const action=(name,args)=>async()=>({name,args});
@@ -36,6 +36,31 @@ test('failed browser candidates stay in history without replacing the selected r
 });
 test('independent visual critique can reject an otherwise functional candidate',async()=>{
   const {p,original,result,outputs}=await scenario([source,patch,render,check,finish('edit'),finish('review')],{critique:'improve'});assert.equal(result.decision,'review');assert.equal(p.revision,original);assert.ok(outputs.some(o=>typeof o==='string'&&o.includes('needs another repair')));assert.equal(p.decisions['pg001_sec001.html'].critique.verdict,'improve');
+});
+test('a Compare repair cannot pass when its explicit user request is unmet',async()=>{
+  const instructions='Make the heading green.';
+  const {p,original,result,modelCalls,critiqueCalls}=await scenario([source,patch,render,check,finish('edit'),finish('review')],{instructions,requestFulfillment:'unmet'});
+  assert.equal(result.decision,'review');assert.equal(p.revision,original);
+  assert.match(modelCalls[0].instructions,/Make the heading green/);
+  const evidence=JSON.parse(critiqueCalls[0].input[0].content[0].text);
+  assert.equal(evidence.userRequest,instructions);
+  assert.match(evidence.candidateHtml,/class="repaired"/);
+  assert.equal(p.decisions['pg001_sec001.html'].critique.verdict,'improve');
+});
+test('an explicit page request can move activity controls to a sibling on the same PDF page',async()=>{
+  const move=async({p,store})=>{
+    const first=(await store.read(p,'pg001_sec001.html')).toString(),second=(await store.read(p,'pg002_sec001.html')).toString();
+    const activity='<label for="thoughts">What will you do today?</label><textarea id="thoughts"></textarea>';
+    return {name:'apply_project_edits',args:{edits:[
+      {path:'pg001_sec001.html',expected_hash:p.files['pg001_sec001.html'],content:first.replace(activity,'')},
+      {path:'pg002_sec001.html',expected_hash:p.files['pg002_sec001.html'],content:second.replace('</main>',activity+'</main>')}
+    ],reason:'Move the writing activity to the second ADT page for PDF page one.',source_pages:[1],removed_controls:[]}};
+  };
+  const {p,result,renders}=await scenario([source,move,render,check,finish('edit')],{sameSource:true,instructions:'Put the writing activity on the second page.'});
+  assert.equal(result.decision,'edit');
+  assert.ok(renders.some(item=>item.href==='pg002_sec001.html'));
+  assert.doesNotMatch((await p.pages.find(item=>item.href==='pg001_sec001.html').text),/What will you do today/);
+  assert.match(p.pages.find(item=>item.href==='pg002_sec001.html').text,/What will you do today/);
 });
 test('repeated unresolved critiques stop a repair in review',async()=>{const {p,result}=await scenario([source,patch,render,check,check,check],{critique:'improve'});assert.equal(result.decision,'review');assert.match(result.summary,/same source concerns/);assert.equal(p.versions['pg001_sec001.html'][1].kind,'candidate');});
 test('shared dependency checks prioritize the same source page and cap repeated full-book renders',async()=>{const pages=Array.from({length:12},(_,i)=>({href:`page-${i}.html`,sourcePage:i<2?9:i,title:`Page ${i}`})),p={pages},files=Object.fromEntries(pages.map(page=>[page.href,'hash'])),store={read:async()=>Buffer.from('<script src="shared.js"></script>')};const coverage=await selectDependentPages(store,p,files,['shared.js'],pages[0]);assert.equal(coverage.pages.length,4);assert.equal(coverage.pages[0].href,'page-1.html');assert.equal(coverage.direct,11);assert.equal(coverage.deferred,7);});
